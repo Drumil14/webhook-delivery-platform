@@ -1,0 +1,10 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+# Allow postinstall scripts for these trusted deps:
+#   esbuild        -> installs its native binary (used by tsx to run the worker)
+#   prisma/engines -> installs the Prisma CLI query/schema engine
+allowBuilds:
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true

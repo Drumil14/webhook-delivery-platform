@@ -1,0 +1,23 @@
+{
+  "name": "webhook-platform",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.13.1",
+  "scripts": {
+    "dev": "concurrently -n web,worker -c blue,green \"pnpm dev:web\" \"pnpm dev:worker\"",
+    "dev:web": "pnpm --filter @webhook/web dev",
+    "dev:worker": "pnpm --filter @webhook/worker dev",
+    "build": "pnpm db:generate && pnpm --filter @webhook/web build",
+    "start:web": "pnpm --filter @webhook/web start",
+    "start:worker": "pnpm --filter @webhook/worker start",
+    "typecheck": "pnpm db:generate && pnpm --recursive typecheck",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5",
+    "prisma": "7.10.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.6.0"
+  }
+}

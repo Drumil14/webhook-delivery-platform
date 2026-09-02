@@ -1,0 +1,28 @@
+// Phase 0 schema: the ABSOLUTE MINIMUM needed to prove connectivity.
+//
+// Prisma 7 notes:
+//  - The `prisma-client` generator (no `-js`) writes the client into the
+//    source tree (see `output`), which is why it is gitignored.
+//  - A driver adapter (@prisma/adapter-pg) is mandatory at runtime; the
+//    connection is wired up in src/client.ts.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// TEMPORARY placeholder model — exists ONLY so the schema is non-empty and to
+/// prove we can create a table with `prisma db push`. Connectivity itself is
+/// checked with a raw `SELECT 1`, so this table is not strictly required.
+///
+/// Future phase note: REPLACE this in Phase 1 with the real domain models
+/// (Account, Endpoint, Event, Delivery, DeliveryAttempt, ...). Do NOT build on
+/// top of it.
+model HealthCheck {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+}

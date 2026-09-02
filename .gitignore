@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# env / secrets (never commit real values)
+.env
+.env.*
+!.env.example
+
+# next.js
+.next/
+next-env.d.ts
+
+# build output
+dist/
+*.tsbuildinfo
+
+# prisma: client is generated into the source tree in Prisma 7
+packages/db/src/generated/
+
+# logs / os
+*.log
+.DS_Store
