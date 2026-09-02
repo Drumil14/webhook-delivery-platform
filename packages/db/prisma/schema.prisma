@@ -1,10 +1,14 @@
-// Phase 0 schema: the ABSOLUTE MINIMUM needed to prove connectivity.
+// Phase 1 schema: real core domain for event ingestion.
 //
 // Prisma 7 notes:
 //  - The `prisma-client` generator (no `-js`) writes the client into the
 //    source tree (see `output`), which is why it is gitignored.
 //  - A driver adapter (@prisma/adapter-pg) is mandatory at runtime; the
-//    connection is wired up in src/client.ts.
+//    connection is wired up in src/client.ts. The CLI URL lives in the
+//    root prisma.config.ts.
+//
+// Scope guardrail: NO Delivery / DeliveryAttempt / queue models yet — those are
+// Phase 2+.
 
 generator client {
   provider = "prisma-client"
@@ -15,14 +19,69 @@ datasource db {
   provider = "postgresql"
 }
 
-/// TEMPORARY placeholder model — exists ONLY so the schema is non-empty and to
-/// prove we can create a table with `prisma db push`. Connectivity itself is
-/// checked with a raw `SELECT 1`, so this table is not strictly required.
+enum EndpointStatus {
+  active
+  paused
+}
+
+/// Minimal V1 account. Exists so ownership boundaries are real; there is NO
+/// login/signup/session system yet. V1 uses a single seeded demo account.
+model Account {
+  id         String   @id @default(uuid())
+  name       String
+  apiKeyHash String
+  createdAt  DateTime @default(now())
+
+  endpoints Endpoint[]
+  events    Event[]
+}
+
+/// A webhook destination owned by an Account. In Phase 1 it exists mainly so an
+/// Event can target something real. No HMAC/rotation/SSRF/rate-limiting/delivery
+/// behavior yet.
+model Endpoint {
+  id                 String         @id @default(uuid())
+  accountId          String
+  url                String
+  // NOTE: field is named `secretEncrypted` for the frozen schema, but real
+  // encryption is a future phase. Phase 1 stores a randomly generated secret.
+  secretEncrypted    String
+  status             EndpointStatus @default(active)
+  rateLimitPerMinute Int            @default(60)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  account Account @relation(fields: [accountId], references: [id])
+  events  Event[]
+
+  @@index([accountId])
+}
+
+/// An ingested event targeting one Endpoint.
 ///
-/// Future phase note: REPLACE this in Phase 1 with the real domain models
-/// (Account, Endpoint, Event, Delivery, DeliveryAttempt, ...). Do NOT build on
-/// top of it.
-model HealthCheck {
-  id        Int      @id @default(autoincrement())
-  createdAt DateTime @default(now())
+/// - `payload`  (jsonb): parsed body, used for querying/display.
+/// - `payloadRaw` (text): the exact serialized body received; the canonical
+///   source of bytes that future phases will sign and deliver.
+/// - `payloadFingerprint`: SHA-256 over (endpointId + payloadRaw), so the same
+///   idempotency key with the same body but a DIFFERENT endpoint is treated as a
+///   different operation.
+model Event {
+  id                 String   @id @default(uuid())
+  accountId          String
+  endpointId         String
+  eventType          String
+  payload            Json
+  payloadRaw         String
+  idempotencyKey     String
+  payloadFingerprint String
+  receivedAt         DateTime @default(now())
+
+  account  Account  @relation(fields: [accountId], references: [id])
+  endpoint Endpoint @relation(fields: [endpointId], references: [id])
+
+  // The database unique constraint is the AUTHORITY for idempotency (see
+  // apps/web/lib/ingest.ts — INSERT ... ON CONFLICT DO NOTHING).
+  @@unique([accountId, idempotencyKey])
+  @@index([accountId, receivedAt])
+  @@index([endpointId])
 }

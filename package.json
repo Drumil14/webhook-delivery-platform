@@ -11,7 +11,9 @@
     "start:web": "pnpm --filter @webhook/web start",
     "start:worker": "pnpm --filter @webhook/worker start",
     "typecheck": "pnpm db:generate && pnpm --recursive typecheck",
+    "test": "pnpm db:generate && pnpm --filter @webhook/web test",
     "db:generate": "prisma generate",
+    "db:migrate:deploy": "prisma migrate deploy",
     "db:push": "prisma db push"
   },
   "devDependencies": {
