@@ -17,3 +17,10 @@ export {
 export type { EventBodyValidation, EndpointUrlValidation } from "./validation";
 export { QUEUE_NAME } from "./queue";
 export type { JobPayload } from "./queue";
+export {
+  DEMO_RETRY_POLICY,
+  PRODUCTION_RETRY_POLICY,
+  baseRetryDelayMs,
+  calculateRetryDelay,
+} from "./retry";
+export type { RetryPolicy } from "./retry";

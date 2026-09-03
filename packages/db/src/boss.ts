@@ -13,6 +13,18 @@ import type { Prisma } from "./generated/prisma/client";
 // This module is the ONLY place that imports pg-boss. Everything else uses the
 // small functions below, so pg-boss stays an implementation detail.
 
+// INFRASTRUCTURE retry config (pg-boss's own retries). This layer ONLY covers
+// jobs that never finalized (worker crash, uncaught throw, DB failure, job
+// expiry) — NOT HTTP 500/429, which our app handles by completing the job and
+// enqueuing a fresh scheduled one. Explanations:
+//  - expireInSeconds=60: a fetched (active) job not completed within 60s is
+//    reclaimed. Comfortably above HTTP timeout (10s) + load + finalize tx.
+//  - retryLimit=3: pg-boss re-makes a failed/expired job available up to 3x.
+//  - retryDelay=2: seconds before a reclaimed job becomes fetchable again.
+const INFRA_RETRY_LIMIT = 3;
+const INFRA_RETRY_DELAY_SECONDS = 2;
+const INFRA_EXPIRE_IN_SECONDS = 60;
+
 let startPromise: Promise<PgBoss> | null = null;
 let started: PgBoss | null = null;
 
@@ -29,10 +41,18 @@ function getBoss(): Promise<PgBoss> {
     }
     const boss = new PgBoss(connectionString);
     boss.on("error", (error) => console.error("[pg-boss] error:", error));
+    const queueOptions = {
+      retryLimit: INFRA_RETRY_LIMIT,
+      retryDelay: INFRA_RETRY_DELAY_SECONDS,
+      expireInSeconds: INFRA_EXPIRE_IN_SECONDS,
+    };
     startPromise = boss
       .start()
       .then(async () => {
-        await boss.createQueue(QUEUE_NAME);
+        // createQueue is idempotent (won't update an existing queue), so also
+        // updateQueue to ensure the infra retry config is applied.
+        await boss.createQueue(QUEUE_NAME, queueOptions);
+        await boss.updateQueue(QUEUE_NAME, queueOptions);
         started = boss;
         return boss;
       })
@@ -50,6 +70,29 @@ export async function startDeliveryQueue(): Promise<void> {
   await getBoss();
 }
 
+/** The infra retry config we reconcile the queue to (exposed for verification). */
+export const DELIVERY_QUEUE_CONFIG = {
+  retryLimit: INFRA_RETRY_LIMIT,
+  retryDelay: INFRA_RETRY_DELAY_SECONDS,
+  expireInSeconds: INFRA_EXPIRE_IN_SECONDS,
+} as const;
+
+/** Read the LIVE pg-boss queue config (retryLimit/retryDelay/expireInSeconds). */
+export async function getDeliveryQueueConfig(): Promise<{
+  retryLimit: number | undefined;
+  retryDelay: number | undefined;
+  expireInSeconds: number | undefined;
+} | null> {
+  const boss = await getBoss();
+  const q = await boss.getQueue(QUEUE_NAME);
+  if (!q) return null;
+  return {
+    retryLimit: q.retryLimit,
+    retryDelay: q.retryDelay,
+    expireInSeconds: q.expireInSeconds,
+  };
+}
+
 /**
  * Enqueue the delivery job INSIDE an existing Prisma transaction, using the
  * pg-boss Prisma adapter (`fromPrisma(tx)`). Because the insert into pgboss's
@@ -59,10 +102,17 @@ export async function startDeliveryQueue(): Promise<void> {
  */
 export async function enqueueDeliveryJob(
   tx: Prisma.TransactionClient,
-  payload: JobPayload
+  payload: JobPayload,
+  options: { startAfter?: Date } = {}
 ): Promise<void> {
   const boss = await getBoss();
-  await boss.send(QUEUE_NAME, payload, { db: fromPrisma(tx) });
+  // `startAfter` schedules a webhook RETRY at nextRetryAt; omit for the first
+  // (immediate) job. Written in the caller's transaction via the adapter.
+  // pg-boss validates options strictly, so only include startAfter when set.
+  const sendOptions = options.startAfter
+    ? { db: fromPrisma(tx), startAfter: options.startAfter }
+    : { db: fromPrisma(tx) };
+  await boss.send(QUEUE_NAME, payload, sendOptions);
 }
 
 /**
@@ -70,12 +120,16 @@ export async function enqueueDeliveryJob(
  * callers don't depend on pg-boss types. Manual fetch (not `work()`) is
  * intentional: Phase 3 needs explicit control over when a job is completed.
  */
-export async function fetchDeliveryJob(): Promise<{
-  id: string;
-  data: JobPayload;
-} | null> {
+export async function fetchDeliveryJob(
+  options: { ignoreStartAfter?: boolean } = {}
+): Promise<{ id: string; data: JobPayload } | null> {
   const boss = await getBoss();
-  const jobs = await boss.fetch<JobPayload>(QUEUE_NAME); // default batchSize: 1
+  // `ignoreStartAfter` lets tests grab a scheduled retry job immediately instead
+  // of waiting out its backoff. Production leaves it unset (respects schedule).
+  // pg-boss validates strictly, so only pass the flag when true.
+  const jobs = options.ignoreStartAfter
+    ? await boss.fetch<JobPayload>(QUEUE_NAME, { ignoreStartAfter: true })
+    : await boss.fetch<JobPayload>(QUEUE_NAME);
   const job = jobs[0];
   if (!job) return null;
   return { id: job.id, data: job.data };
@@ -104,6 +158,17 @@ export async function getDeliveryJobState(jobId: string): Promise<string | null>
   const boss = await getBoss();
   const job = await boss.getJobById(QUEUE_NAME, jobId);
   return job?.state ?? null;
+}
+
+/**
+ * Mark a fetched (active) job as failed. This is pg-boss's INFRASTRUCTURE
+ * failure path — the same one an expired/uncompleted job takes — so a job with
+ * infra retry budget becomes eligible again. Used to deterministically exercise
+ * crash/reclaim behavior without waiting for expireInSeconds.
+ */
+export async function failDeliveryJob(jobId: string): Promise<void> {
+  const boss = await getBoss();
+  await boss.fail(QUEUE_NAME, jobId);
 }
 
 /** Delete all jobs on the delivery queue (used by tests for isolation). */

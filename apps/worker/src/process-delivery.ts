@@ -8,18 +8,41 @@ import {
   type DeliveryStatus,
   type FinalizeAttempt,
 } from "@webhook/db";
-import { type JobPayload } from "@webhook/shared";
+import {
+  DEMO_RETRY_POLICY,
+  PRODUCTION_RETRY_POLICY,
+  calculateRetryDelay,
+  type JobPayload,
+  type RetryPolicy,
+} from "@webhook/shared";
 
-// Phase 3: perform a real HTTP webhook delivery, record the attempt, and finalize
-// the Delivery through the guarded transaction. NO retries/backoff/HMAC/SSRF yet.
+// Phase 5: real HTTP delivery + reliability engine (timeout, backoff, jitter,
+// Retry-After, retry scheduling, application dead-letter). NO HMAC/SSRF yet.
 
 const USER_AGENT = "webhook-delivery-platform/0.0.0";
 const MAX_RESPONSE_SNIPPET_BYTES = 10 * 1024; // ~10 KB cap to avoid DB bloat
 
-// Frozen permanent-failure statuses -> Delivery becomes `dead` (no retry).
+// The real webhook request timeout. The demo /timeout receiver waits 12s, so
+// this produces a genuine timeout. Overridable via options for fast tests.
+export const WEBHOOK_TIMEOUT_MS = 10_000;
+
+// Frozen permanent-failure statuses -> Delivery becomes `dead` immediately.
 const PERMANENT_FAILURE_STATUSES = new Set([400, 401, 403, 404, 410]);
 
+// Active policy: demo by default; production only if explicitly selected.
+const ACTIVE_POLICY: RetryPolicy =
+  process.env.WEBHOOK_RETRY_POLICY === "production"
+    ? PRODUCTION_RETRY_POLICY
+    : DEMO_RETRY_POLICY;
+
 type DeliveryJob = { id: string; data: JobPayload };
+
+export type ProcessDeliveryOptions = {
+  policy?: RetryPolicy; // inject a fast policy in tests
+  timeoutMs?: number; // inject a short timeout in tests
+  now?: () => number; // deterministic nextRetryAt in tests
+  random?: () => number; // deterministic jitter in tests
+};
 
 function isValidPayload(data: unknown): data is JobPayload {
   if (typeof data !== "object" || data === null) return false;
@@ -33,6 +56,19 @@ function isValidPayload(data: unknown): data is JobPayload {
   );
 }
 
+/** Retryable HTTP statuses: 429 and all 5xx. Everything else non-2xx = permanent. */
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+/** Parse a simple integer-seconds Retry-After header into ms (null if absent/invalid). */
+function parseRetryAfterMs(headerValue: string | null): number | null {
+  if (!headerValue) return null;
+  const trimmed = headerValue.trim();
+  if (!/^\d+$/.test(trimmed)) return null; // integer seconds only (no HTTP-date)
+  return parseInt(trimmed, 10) * 1000;
+}
+
 /** Read a response body, capped at ~maxBytes, so a huge body can't bloat the DB. */
 async function readCappedText(
   response: Response,
@@ -42,7 +78,6 @@ async function readCappedText(
     const text = await response.text();
     return text.length > 0 ? text.slice(0, maxBytes) : null;
   }
-
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -55,7 +90,6 @@ async function readCappedText(
     }
   }
   await reader.cancel().catch(() => {});
-
   if (total === 0) return null;
   const buffer = Buffer.concat(chunks).subarray(0, maxBytes);
   return new TextDecoder().decode(buffer);
@@ -66,8 +100,6 @@ async function safeComplete(jobId: string): Promise<void> {
   try {
     await completeDeliveryJob(jobId);
   } catch (error) {
-    // The frozen note: complete() may fail if pg-boss already expired/reassigned
-    // the job. Don't turn that into another delivery — just log and move on.
     console.warn(
       `[worker] Best-effort completion failed for job ${jobId} (may be expired/reassigned):`,
       error
@@ -77,9 +109,18 @@ async function safeComplete(jobId: string): Promise<void> {
 
 /**
  * Process exactly one delivery job: load Delivery -> Event -> Endpoint, POST the
- * event's raw body to the endpoint, then finalize via the guarded transaction.
+ * event's raw body (with a timeout), classify the outcome, then finalize via the
+ * guarded transaction — scheduling a retry when appropriate.
  */
-export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
+export async function processDeliveryJob(
+  job: DeliveryJob,
+  options: ProcessDeliveryOptions = {}
+): Promise<void> {
+  const policy = options.policy ?? ACTIVE_POLICY;
+  const timeoutMs = options.timeoutMs ?? WEBHOOK_TIMEOUT_MS;
+  const nowFn = options.now ?? Date.now;
+  const random = options.random ?? Math.random;
+
   if (!isValidPayload(job.data)) {
     console.error(`[worker] Malformed job ${job.id}; discarding.`, job.data);
     await safeComplete(job.id);
@@ -88,12 +129,10 @@ export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
 
   const { deliveryId, expectedAttemptNumber } = job.data;
 
-  // Postgres is the source of truth: load everything by deliveryId.
   const delivery = await prisma.delivery.findUnique({
     where: { id: deliveryId },
     include: { event: { include: { endpoint: true } } },
   });
-
   if (!delivery) {
     console.error(`[worker] Delivery ${deliveryId} not found; discarding job.`);
     await safeComplete(job.id);
@@ -102,8 +141,7 @@ export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
   const event = delivery.event;
   const endpoint = event.endpoint;
 
-  // Build request headers (NO HMAC signature yet — Phase 6). These get stored on
-  // the DeliveryAttempt. No secrets included.
+  // NO HMAC signature yet (Phase 6). No secrets in headers.
   const requestHeaders: Record<string, string> = {
     "content-type": "application/json",
     "user-agent": USER_AGENT,
@@ -115,18 +153,28 @@ export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
   let responseHeaders: Record<string, string> | null = null;
   let responseBodySnippet: string | null = null;
   let errorMessage: string | null = null;
-  let outcome: DeliveryAttemptOutcome;
-  let newStatus: DeliveryStatus;
+  let outcome: DeliveryAttemptOutcome = "failure";
+  let retryable = false;
+  let retryAfterMs: number | null = null;
 
-  // The HTTP call happens OUTSIDE any transaction (network I/O must not hold a DB
-  // transaction open).
+  // HTTP happens OUTSIDE any transaction, with a hard timeout via AbortController.
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   const startedAt = performance.now();
   try {
     const response = await fetch(endpoint.url, {
       method: "POST",
       headers: requestHeaders,
-      // CRITICAL: send the stored raw bytes verbatim — never re-serialize.
-      body: event.payloadRaw,
+      body: event.payloadRaw, // exact stored bytes; never re-serialize
+      signal: controller.signal,
+      // Do NOT follow redirects: we must see the actual 3xx (classified as a
+      // permanent failure below), and following a Location would be an SSRF
+      // vector that Phase 6 hardens. So the worker never chases redirects.
+      redirect: "manual",
     });
 
     responseStatus = response.status;
@@ -135,25 +183,56 @@ export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
 
     if (response.status >= 200 && response.status < 300) {
       outcome = "success";
-      newStatus = "succeeded";
-    } else if (PERMANENT_FAILURE_STATUSES.has(response.status)) {
+      retryable = false;
+    } else if (isRetryableStatus(response.status)) {
       outcome = "failure";
-      newStatus = "dead";
-      errorMessage = `Permanent failure: HTTP ${response.status}`;
+      retryable = true;
+      if (response.status === 429) {
+        retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      }
     } else {
-      // Retryable in Phase 5. For now: record honestly, keep non-terminal.
+      // Non-2xx, non-retryable: the permanent set {400,401,403,404,410} plus any
+      // other 4xx AND 3xx redirects (we use redirect:"manual", so a 302 lands
+      // here). Default: permanent failure -> dead. Keeps HTTP semantics simple.
       outcome = "failure";
-      newStatus = "pending";
-      errorMessage = `Retryable failure: HTTP ${response.status}`;
+      retryable = false;
+      errorMessage = `Permanent failure: HTTP ${response.status}`;
     }
   } catch (error) {
-    // Network error / connection refused etc. Recorded honestly; kept
-    // non-terminal. (timeout/network_error behavior is a later phase.)
-    errorMessage = error instanceof Error ? error.message : String(error);
-    outcome = "network_error";
-    newStatus = "pending";
+    if (timedOut) {
+      outcome = "timeout";
+      errorMessage = `request timed out after ${timeoutMs}ms`;
+    } else {
+      outcome = "network_error";
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    retryable = true;
+  } finally {
+    clearTimeout(timer);
   }
   const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
+
+  // Decide terminal status vs retry.
+  let newStatus: DeliveryStatus;
+  let nextRetryAt: Date | null = null;
+  let retry: { nextExpectedAttemptNumber: number; startAfter: Date } | undefined;
+
+  if (outcome === "success") {
+    newStatus = "succeeded";
+  } else if (!retryable) {
+    newStatus = "dead"; // permanent HTTP failure
+  } else if (expectedAttemptNumber < delivery.maxAttempts) {
+    // Retryable with budget remaining -> schedule next attempt.
+    const nextN = expectedAttemptNumber + 1;
+    const backoff = calculateRetryDelay({ nextAttemptNumber: nextN, policy, random });
+    const delayMs = Math.max(backoff, retryAfterMs ?? 0);
+    nextRetryAt = new Date(nowFn() + delayMs);
+    newStatus = "pending";
+    retry = { nextExpectedAttemptNumber: nextN, startAfter: nextRetryAt };
+  } else {
+    // Retryable but budget exhausted -> application dead-letter.
+    newStatus = "dead";
+  }
 
   const attempt: FinalizeAttempt = {
     requestHeaders,
@@ -171,7 +250,9 @@ export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
     expectedAttemptNumber,
     jobId: job.id,
     newStatus,
+    nextRetryAt,
     attempt,
+    retry,
   });
 
   if (result === "stale") {
@@ -182,14 +263,10 @@ export async function processDeliveryJob(job: DeliveryJob): Promise<void> {
     return;
   }
 
-  // Winner: finalizeDelivery already recorded the attempt and completed the job.
   console.log(
-    `[worker] delivery deliveryId=${deliveryId} attemptNumber=${expectedAttemptNumber} httpStatus=${responseStatus ?? "n/a"} durationMs=${durationMs} outcome=${outcome} deliveryStatus=${newStatus}`
+    `[worker] delivery deliveryId=${deliveryId} attemptNumber=${expectedAttemptNumber} ` +
+      `httpStatus=${responseStatus ?? "n/a"} durationMs=${durationMs} outcome=${outcome} ` +
+      `deliveryStatus=${newStatus} retryScheduled=${retry ? "true" : "false"} ` +
+      `nextRetryAt=${nextRetryAt ? nextRetryAt.toISOString() : "null"}`
   );
-
-  if (newStatus === "pending") {
-    console.warn(
-      `[worker] Retry scheduling is NOT implemented until Phase 5; leaving deliveryId=${deliveryId} pending and creating NO new job.`
-    );
-  }
 }

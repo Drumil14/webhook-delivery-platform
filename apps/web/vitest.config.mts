@@ -24,6 +24,12 @@ export default defineConfig({
     // sequentially so a queue `fetch()` in one file can't grab another file's
     // job. (Tests within a file already run sequentially.)
     fileParallelism: false,
+    // These are real integration tests against remote Neon (many round-trips per
+    // test: ingest + fetch + finalize transactions + queue ops). The default 5s
+    // is too tight under network latency, so raise it. (Retry delays themselves
+    // are already tiny via injected test policies — this is purely network time.)
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
     // Forward the resolved connection string to worker processes.
     env: {
       DATABASE_URL: process.env.DATABASE_URL ?? "",

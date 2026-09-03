@@ -278,6 +278,7 @@ describe("Phase 3 — HTTP delivery + guarded finalize", () => {
       expectedAttemptNumber: 1,
       jobId: job!.id,
       newStatus: "succeeded",
+      nextRetryAt: null,
       attempt: fixtureAttempt(),
     };
 
@@ -306,6 +307,7 @@ describe("Phase 3 — HTTP delivery + guarded finalize", () => {
       expectedAttemptNumber: 1,
       jobId: job!.id,
       newStatus: "succeeded",
+      nextRetryAt: null,
       attempt: fixtureAttempt(),
     });
 
@@ -331,6 +333,7 @@ describe("Phase 3 — HTTP delivery + guarded finalize", () => {
           expectedAttemptNumber: 1,
           jobId: job!.id,
           newStatus: "succeeded",
+          nextRetryAt: null,
           attempt: fixtureAttempt(),
         },
         { beforeCommit: async () => { throw new Error("boom before commit"); } }

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { completeDeliveryJob } from "./boss";
+import { completeDeliveryJob, enqueueDeliveryJob } from "./boss";
 import { prisma } from "./client";
 import type {
   DeliveryAttemptOutcome,
@@ -23,10 +23,15 @@ export type FinalizeInput = {
   deliveryId: string;
   expectedAttemptNumber: number;
   jobId: string;
-  // New Delivery status: 'succeeded' | 'dead' | 'pending' (pending = non-terminal
-  // failure that Phase 5 will make retryable).
+  // New Delivery status: 'succeeded' | 'dead' | 'pending' (pending = retryable
+  // failure with budget remaining).
   newStatus: DeliveryStatus;
+  // Application/display schedule; null when terminal (succeeded/dead).
+  nextRetryAt: Date | null;
   attempt: FinalizeAttempt;
+  // When present (retryable failure with budget), enqueue the next scheduled job
+  // INSIDE this transaction. `startAfter` equals nextRetryAt so they can't drift.
+  retry?: { nextExpectedAttemptNumber: number; startAfter: Date };
 };
 
 export type FinalizeResult = "won" | "stale";
@@ -62,13 +67,15 @@ export async function finalizeDelivery(
   input: FinalizeInput,
   hooks: FinalizeHooks = {}
 ): Promise<FinalizeResult> {
-  const { deliveryId, expectedAttemptNumber, jobId, newStatus, attempt } = input;
+  const { deliveryId, expectedAttemptNumber, jobId, newStatus, nextRetryAt, attempt, retry } =
+    input;
 
   return prisma.$transaction(async (tx) => {
     const won = await tx.$queryRaw<{ id: string }[]>`
       UPDATE "Delivery"
       SET "attemptCount" = "attemptCount" + 1,
           "status" = ${newStatus}::"DeliveryStatus",
+          "nextRetryAt" = ${nextRetryAt},
           "updatedAt" = NOW()
       WHERE "id" = ${deliveryId}
         AND "attemptCount" = ${expectedAttemptNumber - 1}
@@ -100,7 +107,16 @@ export async function finalizeDelivery(
       )
     `;
 
-    // Complete the queue job inside the SAME transaction.
+    // Retryable-with-budget: enqueue the NEXT scheduled job in this same tx.
+    if (retry) {
+      await enqueueDeliveryJob(
+        tx,
+        { deliveryId, expectedAttemptNumber: retry.nextExpectedAttemptNumber },
+        { startAfter: retry.startAfter }
+      );
+    }
+
+    // Complete the CURRENT queue job inside the SAME transaction.
     await completeDeliveryJob(jobId, tx);
 
     if (hooks.beforeCommit) {
