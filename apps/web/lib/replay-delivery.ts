@@ -1,4 +1,4 @@
-import { enqueueDeliveryJob, prisma } from "@webhook/db";
+import { enqueueDeliveryJob, notifyDeliveryUpdate, prisma } from "@webhook/db";
 import { DEMO_RETRY_POLICY, type JobPayload } from "@webhook/shared";
 
 // Phase 7 — manual replay of a DEAD delivery as a brand-new Delivery.
@@ -76,6 +76,15 @@ export async function replayDelivery(
     // Delivery row and the job commit atomically.
     const payload: JobPayload = { deliveryId: newDelivery.id, expectedAttemptNumber: 1 };
     await enqueue(tx, payload);
+
+    // Realtime signal referencing the NEW replay Delivery, inside this tx (fires
+    // only on commit; a rollback emits nothing).
+    await notifyDeliveryUpdate(tx, {
+      accountId: original.event.accountId,
+      deliveryId: newDelivery.id,
+      eventId: original.event.id,
+      kind: "replayed",
+    });
 
     return newDelivery;
   });

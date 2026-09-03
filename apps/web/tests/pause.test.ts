@@ -154,13 +154,13 @@ describe("Phase 7 — endpoint pause / resume", () => {
 
   it("P7-7: paused deferral rolls back atomically on failure", async () => {
     const endpointId = await makeEndpoint("paused");
-    const { deliveryId } = await ingestForEndpoint(accountId, endpointId, uniqueKey());
+    const { deliveryId, eventId } = await ingestForEndpoint(accountId, endpointId, uniqueKey());
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
     const deferUntil = new Date(Date.now() + 30_000);
 
     await expect(
       deferDeliveryJob(
-        { deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil },
+        { deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil, accountId, eventId },
         { beforeCommit: async () => { throw new Error("boom"); } }
       )
     ).rejects.toThrow("boom");

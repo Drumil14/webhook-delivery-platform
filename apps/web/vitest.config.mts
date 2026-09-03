@@ -30,9 +30,10 @@ export default defineConfig({
     // are already tiny via injected test policies — this is purely network time.)
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    // Forward the resolved connection string + master key to worker processes.
+    // Forward the resolved connection string + master key + direct LISTEN URL.
     env: {
       DATABASE_URL: process.env.DATABASE_URL ?? "",
+      DATABASE_URL_UNPOOLED: process.env.DATABASE_URL_UNPOOLED ?? "",
       WEBHOOK_SECRET_ENCRYPTION_KEY: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY ?? "",
     },
   },

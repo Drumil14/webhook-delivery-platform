@@ -146,13 +146,13 @@ describe("Phase 7 — per-endpoint rate limiting", () => {
 
   it("P7-3: rate-limit deferral rolls back atomically on failure", async () => {
     const endpointId = await makeEndpoint(5);
-    const { deliveryId } = await ingestForEndpoint(accountId, endpointId, uniqueKey());
+    const { deliveryId, eventId } = await ingestForEndpoint(accountId, endpointId, uniqueKey());
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
     const deferUntil = new Date(Date.now() + 60_000);
 
     await expect(
       deferDeliveryJob(
-        { deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil },
+        { deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil, accountId, eventId },
         { beforeCommit: async () => { throw new Error("boom"); } }
       )
     ).rejects.toThrow("boom");
@@ -165,7 +165,7 @@ describe("Phase 7 — per-endpoint rate limiting", () => {
 
   it("P7-18: concurrent deferrals of the same delivery/attempt cannot both schedule", async () => {
     const endpointId = await makeEndpoint(60);
-    const { deliveryId } = await ingestForEndpoint(accountId, endpointId, uniqueKey());
+    const { deliveryId, eventId } = await ingestForEndpoint(accountId, endpointId, uniqueKey());
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
     const deferUntil = new Date(Date.now() + 60_000);
 
@@ -173,8 +173,8 @@ describe("Phase 7 — per-endpoint rate limiting", () => {
     // (Deferral is transport-agnostic, so this one helper-level race covers both
     // the pause and rate-limit paths, which both call deferDeliveryJob.)
     const [r1, r2] = await Promise.all([
-      deferDeliveryJob({ deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil }),
-      deferDeliveryJob({ deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil }),
+      deferDeliveryJob({ deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil, accountId, eventId }),
+      deferDeliveryJob({ deliveryId, expectedAttemptNumber: 1, jobId: job!.id, deferUntil, accountId, eventId }),
     ]);
 
     // Exactly one wins; the other is stale — never both.

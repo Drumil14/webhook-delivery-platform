@@ -47,6 +47,19 @@ export type {
   VerifyResult,
 } from "./signing";
 
+// Phase 8 — realtime delivery-update notification contract.
+export {
+  DELIVERY_UPDATE_CHANNEL,
+  serializeDeliveryUpdate,
+  parseDeliveryUpdate,
+  toBrowserPayload,
+} from "./realtime";
+export type {
+  DeliveryUpdateKind,
+  DeliveryUpdateNotification,
+  DeliveryUpdateBrowserPayload,
+} from "./realtime";
+
 // Phase 6 — SSRF policy: URL syntax + IP classification + resolve/validate.
 export {
   validateEndpointUrlSyntax,

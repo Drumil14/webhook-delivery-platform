@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { enqueueDeliveryJob, prisma } from "@webhook/db";
+import { enqueueDeliveryJob, notifyDeliveryUpdate, prisma } from "@webhook/db";
 import { computePayloadFingerprint, type JobPayload } from "@webhook/shared";
 
 export type EventSummary = {
@@ -88,6 +88,16 @@ export async function ingestEvent(
 
       const payload: JobPayload = { deliveryId, expectedAttemptNumber: 1 };
       await enqueue(tx, payload);
+
+      // Realtime signal for the genuinely-new Delivery, INSIDE this transaction
+      // (fires only on commit). Idempotent duplicate/conflict paths below create
+      // nothing, so they emit no notification.
+      await notifyDeliveryUpdate(tx, {
+        accountId: event.accountId,
+        deliveryId,
+        eventId: event.id,
+        kind: "created",
+      });
 
       return { outcome: "created", event };
     }

@@ -353,10 +353,16 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
 
     const nextRetryAt = new Date(Date.now() + 1_000);
+    const { eventId } = await prisma.delivery.findUniqueOrThrow({
+      where: { id: deliveryId },
+      select: { eventId: true },
+    });
     const input: FinalizeInput = {
       deliveryId,
       expectedAttemptNumber: 1,
       jobId: job!.id,
+      accountId,
+      eventId,
       newStatus: "pending",
       nextRetryAt,
       attempt: fixtureAttempt(),
@@ -384,10 +390,16 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
     await prisma.delivery.update({ where: { id: deliveryId }, data: { attemptCount: 5 } });
 
     const nextRetryAt = new Date(Date.now() + 1_000);
+    const { eventId } = await prisma.delivery.findUniqueOrThrow({
+      where: { id: deliveryId },
+      select: { eventId: true },
+    });
     const result = await finalizeDelivery({
       deliveryId,
       expectedAttemptNumber: 1, // guard wants attemptCount=0, but it's 5 -> stale
       jobId: job!.id,
+      accountId,
+      eventId,
       newStatus: "pending",
       nextRetryAt,
       attempt: fixtureAttempt(),

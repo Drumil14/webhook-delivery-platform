@@ -165,6 +165,8 @@ export async function processDeliveryJob(
       expectedAttemptNumber,
       jobId: job.id,
       deferUntil,
+      accountId: event.accountId,
+      eventId: event.id,
     });
     if (result === "stale") {
       await safeComplete(job.id);
@@ -224,6 +226,8 @@ export async function processDeliveryJob(
       deliveryId,
       expectedAttemptNumber,
       jobId: job.id,
+      accountId: event.accountId,
+      eventId: event.id,
       requestHeaders,
       errorMessage: "endpoint signing secret unavailable",
       resolvedIp: null,
@@ -339,6 +343,8 @@ export async function processDeliveryJob(
     deliveryId,
     expectedAttemptNumber,
     jobId: job.id,
+    accountId: event.accountId,
+    eventId: event.id,
     newStatus,
     nextRetryAt,
     attempt,
@@ -370,6 +376,8 @@ async function finalizeTerminal(args: {
   deliveryId: string;
   expectedAttemptNumber: number;
   jobId: string;
+  accountId: string;
+  eventId: string;
   requestHeaders: Record<string, string>;
   errorMessage: string;
   resolvedIp: string | null;
@@ -388,6 +396,8 @@ async function finalizeTerminal(args: {
     deliveryId: args.deliveryId,
     expectedAttemptNumber: args.expectedAttemptNumber,
     jobId: args.jobId,
+    accountId: args.accountId,
+    eventId: args.eventId,
     newStatus: "dead",
     nextRetryAt: null,
     attempt,

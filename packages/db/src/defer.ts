@@ -1,5 +1,6 @@
 import { completeDeliveryJob, enqueueDeliveryJob } from "./boss";
 import { prisma } from "./client";
+import { notifyDeliveryUpdate } from "./notify";
 import type { Prisma } from "./generated/prisma/client";
 
 // Phase 7 — non-attempt deferral of a delivery job.
@@ -49,10 +50,12 @@ export async function deferDeliveryJob(
     expectedAttemptNumber: number; // SAME number — no attempt consumed
     jobId: string; // current job to complete
     deferUntil: Date; // nextRetryAt + replacement startAfter
+    accountId: string; // for the realtime notification
+    eventId: string; // for the realtime notification
   },
   hooks: DeferHooks = {}
 ): Promise<DeferResult> {
-  const { deliveryId, expectedAttemptNumber, jobId, deferUntil } = input;
+  const { deliveryId, expectedAttemptNumber, jobId, deferUntil, accountId, eventId } = input;
 
   try {
     return await prisma.$transaction(async (tx) => {
@@ -91,6 +94,10 @@ export async function deferDeliveryJob(
       if (affected === 0) {
         throw new StaleDeferral();
       }
+
+      // Realtime signal for the committed deferral (won path only; the stale
+      // paths above emit nothing). Inside the tx: rollback suppresses it.
+      await notifyDeliveryUpdate(tx, { accountId, deliveryId, eventId, kind: "deferred" });
 
       if (hooks.beforeCommit) {
         await hooks.beforeCommit(tx);

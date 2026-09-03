@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { completeDeliveryJob, enqueueDeliveryJob } from "./boss";
 import { prisma } from "./client";
+import { notifyDeliveryUpdate } from "./notify";
 import type {
   DeliveryAttemptOutcome,
   DeliveryStatus,
@@ -23,6 +24,10 @@ export type FinalizeInput = {
   deliveryId: string;
   expectedAttemptNumber: number;
   jobId: string;
+  // For the realtime notification (routing + browser refetch target). Not used in
+  // the guarded update itself.
+  accountId: string;
+  eventId: string;
   // New Delivery status: 'succeeded' | 'dead' | 'pending' (pending = retryable
   // failure with budget remaining).
   newStatus: DeliveryStatus;
@@ -67,7 +72,7 @@ export async function finalizeDelivery(
   input: FinalizeInput,
   hooks: FinalizeHooks = {}
 ): Promise<FinalizeResult> {
-  const { deliveryId, expectedAttemptNumber, jobId, newStatus, nextRetryAt, attempt, retry } =
+  const { deliveryId, expectedAttemptNumber, jobId, accountId, eventId, newStatus, nextRetryAt, attempt, retry } =
     input;
 
   return prisma.$transaction(async (tx) => {
@@ -118,6 +123,10 @@ export async function finalizeDelivery(
 
     // Complete the CURRENT queue job inside the SAME transaction.
     await completeDeliveryJob(jobId, tx);
+
+    // Realtime signal for the committed attempt (won path only — the stale-loser
+    // path returned above and emits nothing). Inside the tx: rollback suppresses it.
+    await notifyDeliveryUpdate(tx, { accountId, deliveryId, eventId, kind: "attempted" });
 
     if (hooks.beforeCommit) {
       await hooks.beforeCommit(tx);

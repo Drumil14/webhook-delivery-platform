@@ -34,6 +34,9 @@ export {
 } from "./rate-limit";
 export type { RateLimitAcquisition } from "./rate-limit";
 
+// Phase 8 — realtime Delivery-update publisher (transactional pg_notify).
+export { notifyDeliveryUpdate } from "./notify";
+
 // Re-export generated Prisma types/enums (e.g. Account, Endpoint, Event,
 // EndpointStatus, Prisma) so consumers don't import from the generated path.
 export * from "./generated/prisma/client";
