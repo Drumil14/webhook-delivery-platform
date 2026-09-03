@@ -24,7 +24,12 @@ import {
 
 import { ingestEvent } from "@/lib/ingest";
 import { handleDemoReceiver } from "@/lib/demo-receiver";
-import { insertEndpointRow, loadIpTestCert, loadTestCerts } from "./helpers/phase6";
+import {
+  deleteEndpointsAndWindows,
+  insertEndpointRow,
+  loadIpTestCert,
+  loadTestCerts,
+} from "./helpers/phase6";
 
 // ---------------------------------------------------------------------------
 // Real HTTPS receiver behind the ACTUAL production pinned transport. We connect
@@ -189,9 +194,7 @@ afterAll(async () => {
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
   }
-  if (endpointIds.length > 0) {
-    await prisma.endpoint.deleteMany({ where: { id: { in: endpointIds } } });
-  }
+  await deleteEndpointsAndWindows(endpointIds);
   await purgeDeliveryQueue();
   await stopDeliveryQueue();
   await new Promise<void>((resolve) => server.close(() => resolve()));

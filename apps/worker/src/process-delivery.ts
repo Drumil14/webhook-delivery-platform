@@ -2,8 +2,11 @@ import { performance } from "node:perf_hooks";
 
 import {
   completeDeliveryJob,
+  deferDeliveryJob,
   finalizeDelivery,
+  nextWindowStart,
   prisma,
+  tryAcquireEndpointRateLimit,
   type DeliveryAttemptOutcome,
   type DeliveryStatus,
   type FinalizeAttempt,
@@ -37,6 +40,10 @@ const USER_AGENT = "webhook-delivery-platform/0.0.0";
 // this produces a genuine timeout. Overridable via options for fast tests.
 export const WEBHOOK_TIMEOUT_MS = 10_000;
 
+// Phase 7: how long a paused-endpoint job waits before being re-checked. A small
+// fixed delay (no backoff/jitter) so we don't hammer Postgres every second.
+export const PAUSED_RECHECK_DELAY_MS = 30_000;
+
 // Frozen permanent-failure statuses -> Delivery becomes `dead` immediately.
 const PERMANENT_FAILURE_STATUSES = new Set([400, 401, 403, 404, 410]);
 
@@ -55,9 +62,10 @@ export type WebhookTransport = (req: TransportRequest) => Promise<TransportResul
 export type ProcessDeliveryOptions = {
   policy?: RetryPolicy; // inject a fast policy in tests
   timeoutMs?: number; // inject a short timeout in tests
-  now?: () => number; // deterministic nextRetryAt / signature timestamp in tests
+  now?: () => number; // deterministic nextRetryAt / signature timestamp / rate window in tests
   random?: () => number; // deterministic jitter in tests
   transport?: WebhookTransport; // inject a deterministic transport in tests
+  pauseRecheckMs?: number; // inject a short paused-recheck delay in tests
 };
 
 function isValidPayload(data: unknown): data is JobPayload {
@@ -112,6 +120,7 @@ export async function processDeliveryJob(
   const nowFn = options.now ?? Date.now;
   const random = options.random ?? Math.random;
   const transport = options.transport ?? ((req) => secureWebhookRequest(req));
+  const pauseRecheckMs = options.pauseRecheckMs ?? PAUSED_RECHECK_DELAY_MS;
 
   if (!isValidPayload(job.data)) {
     console.error(`[worker] Malformed job ${job.id}; discarding.`, job.data);
@@ -132,6 +141,59 @@ export async function processDeliveryJob(
   }
   const event = delivery.event;
   const endpoint = event.endpoint;
+
+  // STALENESS gate (before any pause/rate/security/HTTP work): the guarded
+  // finalize protects the commit, but a job whose Delivery is already terminal or
+  // has been advanced by a newer attempt should never trigger an HTTP request.
+  if (
+    delivery.status !== "pending" ||
+    delivery.attemptCount !== expectedAttemptNumber - 1
+  ) {
+    console.warn(
+      `[worker] Obsolete job deliveryId=${deliveryId} status=${delivery.status} ` +
+        `attemptCount=${delivery.attemptCount} expected=${expectedAttemptNumber}; discarding.`
+    );
+    await safeComplete(job.id);
+    return;
+  }
+
+  // Defer this job (no attempt, no attemptCount change) to `deferUntil`, keeping
+  // the SAME expectedAttemptNumber. Shared by pause and rate-limit deferral.
+  const deferJob = async (reason: "paused" | "rate_limited", deferUntil: Date) => {
+    const result = await deferDeliveryJob({
+      deliveryId,
+      expectedAttemptNumber,
+      jobId: job.id,
+      deferUntil,
+    });
+    if (result === "stale") {
+      await safeComplete(job.id);
+    }
+    console.log(
+      `[worker] deferred deliveryId=${deliveryId} expectedAttemptNumber=${expectedAttemptNumber} ` +
+        `reason=${reason} deferredUntil=${deferUntil.toISOString()} result=${result}`
+    );
+  };
+
+  // PAUSE — checked BEFORE consuming rate-limit capacity so a paused endpoint
+  // never eats a rate-limit slot. No HTTP, no DeliveryAttempt, no attemptCount change.
+  if (endpoint.status === "paused") {
+    await deferJob("paused", new Date(nowFn() + pauseRecheckMs));
+    return;
+  }
+
+  // OUR per-endpoint rate limit (fixed UTC-minute window). Only a request that is
+  // actually allowed to proceed consumes a slot. Over budget -> defer to the next
+  // window with the SAME expectedAttemptNumber (no attempt consumed).
+  const acquisition = await tryAcquireEndpointRateLimit(
+    endpoint.id,
+    endpoint.rateLimitPerMinute,
+    nowFn()
+  );
+  if (!acquisition.allowed) {
+    await deferJob("rate_limited", nextWindowStart(nowFn()));
+    return;
+  }
 
   // Base headers (no signature yet). Never include the plaintext signing secret.
   const requestHeaders: Record<string, string> = {

@@ -56,8 +56,9 @@ model Endpoint {
   createdAt          DateTime       @default(now())
   updatedAt          DateTime       @updatedAt
 
-  account Account @relation(fields: [accountId], references: [id])
-  events  Event[]
+  account     Account              @relation(fields: [accountId], references: [id])
+  events      Event[]
+  rateWindows EndpointRateWindow[]
 
   @@index([accountId])
 }
@@ -119,6 +120,10 @@ model Delivery {
   // Matches the active demo retry policy (6 attempts). Phase 5 will derive/set
   // this explicitly from the selected retry policy.
   maxAttempts        Int             @default(6)
+  // Displayable "next scheduled delivery execution" timestamp. Phase 5 set it for
+  // webhook RETRY backoff; Phase 7 also sets it for NON-attempt deferrals (paused
+  // endpoint recheck, rate-limit next-window). Cleared/replaced by finalization
+  // once an actual HTTP attempt runs.
   nextRetryAt        DateTime?
   triggeredBy        DeliveryTrigger @default(automatic)
   replayOfDeliveryId String?
@@ -183,4 +188,23 @@ model DemoReceiverState {
   deliveryId   String   @id
   requestCount Int      @default(0)
   updatedAt    DateTime @updatedAt
+}
+
+/// Phase 7 per-endpoint fixed-window rate limiter state (real product reliability
+/// state, unlike DemoReceiverState — hence a proper FK to Endpoint).
+///
+/// One row per (endpoint, UTC minute). `windowStart` is the beginning of the UTC
+/// minute (e.g. 10:24:37 -> 10:24:00). `requestCount` is incremented atomically
+/// (INSERT ... ON CONFLICT DO UPDATE ... WHERE requestCount < limit) so only
+/// requests actually allowed to proceed count against the budget. No sliding
+/// window / token bucket / Redis — fixed-window is sufficient for V1.
+model EndpointRateWindow {
+  endpointId   String
+  windowStart  DateTime
+  requestCount Int      @default(0)
+  updatedAt    DateTime @updatedAt
+
+  endpoint Endpoint @relation(fields: [endpointId], references: [id])
+
+  @@id([endpointId, windowStart])
 }

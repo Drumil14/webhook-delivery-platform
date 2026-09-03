@@ -140,17 +140,23 @@ export async function fetchDeliveryJob(
  * completion is run through the pg-boss Prisma adapter so it joins that
  * transaction (used by the guarded finalize so Delivery state + attempt + queue
  * completion commit together).
+ *
+ * Returns the number of jobs actually transitioned (0 or 1). pg-boss's completion
+ * SQL is `UPDATE ... WHERE id = ? AND state = 'active'`, so the return acts as a
+ * compare-and-set: 1 means THIS call completed an active job; 0 means the job was
+ * already completed (e.g. by a concurrent worker) — used by deferDeliveryJob to
+ * make concurrent deferrals of the same job mutually exclusive.
  */
 export async function completeDeliveryJob(
   jobId: string,
   tx?: Prisma.TransactionClient
-): Promise<void> {
+): Promise<number> {
   const boss = await getBoss();
-  if (tx) {
-    await boss.complete(QUEUE_NAME, jobId, null, { db: fromPrisma(tx) });
-  } else {
-    await boss.complete(QUEUE_NAME, jobId);
-  }
+  const response = tx
+    ? await boss.complete(QUEUE_NAME, jobId, null, { db: fromPrisma(tx) })
+    : await boss.complete(QUEUE_NAME, jobId);
+  // CommandResponse is typed as {} but carries `affected` at runtime.
+  return (response as { affected?: number }).affected ?? 0;
 }
 
 /** Test-support: current pg-boss state of a job ('active' | 'completed' | ...) or null. */

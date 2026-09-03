@@ -21,6 +21,8 @@ import type {
   TransportResult,
 } from "@webhook/worker/secure-transport";
 
+import { ingestEvent } from "@/lib/ingest";
+
 const FIXTURES_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 
 /** The controlled test CA + leaf cert (SAN: webhook.test), generated with openssl. */
@@ -54,15 +56,83 @@ export function testMasterKey(): Buffer {
  */
 export async function insertEndpointRow(
   accountId: string,
-  url: string
+  url: string,
+  opts: { rateLimitPerMinute?: number; status?: "active" | "paused" } = {}
 ): Promise<{ id: string; secret: string }> {
   const secret = generateSigningSecret();
   const secretEncrypted = encryptSecret(secret, testMasterKey());
   const endpoint = await prisma.endpoint.create({
-    data: { accountId, url, secretEncrypted },
+    data: {
+      accountId,
+      url,
+      secretEncrypted,
+      ...(opts.rateLimitPerMinute !== undefined
+        ? { rateLimitPerMinute: opts.rateLimitPerMinute }
+        : {}),
+      ...(opts.status !== undefined ? { status: opts.status } : {}),
+    },
     select: { id: true },
   });
   return { id: endpoint.id, secret };
+}
+
+/**
+ * Delete endpoints AND their rate-window rows (Phase 7 added a restrictive FK
+ * from EndpointRateWindow -> Endpoint, so windows must go first). Safe to call
+ * with endpoints that have no windows.
+ */
+export async function deleteEndpointsAndWindows(endpointIds: string[]): Promise<void> {
+  if (endpointIds.length === 0) return;
+  await prisma.endpointRateWindow.deleteMany({ where: { endpointId: { in: endpointIds } } });
+  await prisma.endpoint.deleteMany({ where: { id: { in: endpointIds } } });
+}
+
+/** Ingest one event for an endpoint (real transactional path) -> returns ids. */
+export async function ingestForEndpoint(
+  accountId: string,
+  endpointId: string,
+  idempotencyKey: string,
+  rawBody?: string
+): Promise<{ deliveryId: string; eventId: string }> {
+  const payloadRaw = rawBody ?? JSON.stringify({ type: "order.created", data: { k: idempotencyKey } });
+  const result = await ingestEvent({
+    accountId,
+    endpointId,
+    eventType: "order.created",
+    payloadRaw,
+    idempotencyKey,
+  });
+  if (result.outcome !== "created") throw new Error(`ingest did not create: ${result.outcome}`);
+  const delivery = await prisma.delivery.findFirstOrThrow({
+    where: { eventId: result.event.id },
+    select: { id: true },
+  });
+  return { deliveryId: delivery.id, eventId: result.event.id };
+}
+
+/**
+ * A spy transport that records every call and returns a canned result (200 by
+ * default). Used by deferral tests to prove NO HTTP request was made (calls stay
+ * empty) when a job is paused/rate-limited.
+ */
+export function spyTransport(result?: TransportResult): {
+  transport: (req: TransportRequest) => Promise<TransportResult>;
+  calls: TransportRequest[];
+} {
+  const calls: TransportRequest[] = [];
+  const transport = async (req: TransportRequest): Promise<TransportResult> => {
+    calls.push(req);
+    return (
+      result ?? {
+        kind: "response",
+        status: 200,
+        headers: {},
+        bodyText: null,
+        resolvedIp: "127.0.0.1",
+      }
+    );
+  };
+  return { transport, calls };
 }
 
 /**

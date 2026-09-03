@@ -69,6 +69,23 @@ export async function createEndpoint(
     return { status: 400, body: { error: "UNSAFE_ENDPOINT_URL", message: syntax.message } };
   }
 
+  // Optional per-endpoint rate limit (positive integer; default 60). Not a
+  // settings system — just an optional field on creation.
+  const rlRaw = (body as Record<string, unknown> | null)?.rateLimitPerMinute;
+  let rateLimitPerMinute = 60;
+  if (rlRaw !== undefined) {
+    if (typeof rlRaw !== "number" || !Number.isInteger(rlRaw) || rlRaw < 1 || rlRaw > 10_000) {
+      return {
+        status: 400,
+        body: {
+          error: "VALIDATION_ERROR",
+          message: "`rateLimitPerMinute` must be an integer between 1 and 10000.",
+        },
+      };
+    }
+    rateLimitPerMinute = rlRaw;
+  }
+
   // 4-5. Creation-time SSRF check: resolve the hostname and validate every
   // address. This is fast advisory feedback — the delivery-time check in the
   // worker is the real security boundary (DNS can change between now and then).
@@ -92,6 +109,7 @@ export async function createEndpoint(
       accountId: account.id,
       url: syntax.url,
       secretEncrypted,
+      rateLimitPerMinute,
     },
     select: {
       id: true,

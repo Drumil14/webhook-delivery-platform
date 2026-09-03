@@ -27,7 +27,7 @@ import {
 
 import { handleDemoReceiver } from "@/lib/demo-receiver";
 import { POST as postEvent } from "@/app/api/v1/endpoints/[endpointId]/events/route";
-import { httpLoopbackTransport, insertEndpointRow } from "./helpers/phase6";
+import { deleteEndpointsAndWindows, httpLoopbackTransport, insertEndpointRow } from "./helpers/phase6";
 
 // Deterministic loopback transport: the worker's SSRF-safe HTTPS transport can't
 // reach the plain-HTTP local receiver, so Phase 5 reliability tests inject this
@@ -222,9 +222,7 @@ afterAll(async () => {
       await prisma.event.deleteMany({ where: { id: { in: eventIds } } });
     }
   }
-  if (createdEndpointIds.length > 0) {
-    await prisma.endpoint.deleteMany({ where: { id: { in: createdEndpointIds } } });
-  }
+  await deleteEndpointsAndWindows(createdEndpointIds);
   await purgeDeliveryQueue();
   await stopDeliveryQueue();
   await new Promise<void>((resolve) => server.close(() => resolve()));

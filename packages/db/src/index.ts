@@ -22,6 +22,18 @@ export type {
   FinalizeHooks,
 } from "./finalize";
 
+// Phase 7 — non-attempt job deferral (paused / rate-limited).
+export { deferDeliveryJob } from "./defer";
+export type { DeferResult, DeferHooks } from "./defer";
+
+// Phase 7 — per-endpoint fixed-window rate limiter.
+export {
+  tryAcquireEndpointRateLimit,
+  windowStartFor,
+  nextWindowStart,
+} from "./rate-limit";
+export type { RateLimitAcquisition } from "./rate-limit";
+
 // Re-export generated Prisma types/enums (e.g. Account, Endpoint, Event,
 // EndpointStatus, Prisma) so consumers don't import from the generated path.
 export * from "./generated/prisma/client";
