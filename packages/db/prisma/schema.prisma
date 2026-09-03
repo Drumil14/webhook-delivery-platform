@@ -125,9 +125,10 @@ model Delivery {
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
 
-  event    Event      @relation(fields: [eventId], references: [id])
-  replayOf Delivery?  @relation("DeliveryReplays", fields: [replayOfDeliveryId], references: [id])
-  replays  Delivery[] @relation("DeliveryReplays")
+  event    Event             @relation(fields: [eventId], references: [id])
+  replayOf Delivery?         @relation("DeliveryReplays", fields: [replayOfDeliveryId], references: [id])
+  replays  Delivery[]        @relation("DeliveryReplays")
+  attempts DeliveryAttempt[]
 
   @@index([eventId])
   // Frozen index for the future retry sweeper (Phase 3+): find due deliveries.
@@ -136,4 +137,39 @@ model Delivery {
   // still add additional (manual_replay) Delivery rows for the same Event later.
   // NOT a plain UNIQUE(eventId) — that would block Phase 7 replay.
   @@unique([eventId], where: raw("\"triggeredBy\" = 'automatic'"), map: "Delivery_eventId_automatic_key")
+}
+
+enum DeliveryAttemptOutcome {
+  success
+  failure
+  // Phase 3 does not actively exercise these; they belong to later phases but
+  // exist now as part of the frozen schema.
+  timeout
+  network_error
+}
+
+/// One HTTP attempt to deliver a Delivery to its Endpoint. Immutable history:
+/// a new row per attempt (attemptNumber). Separate from Delivery so the Delivery
+/// holds current state while attempts hold the full audit trail.
+///
+/// Future phase note: `resolvedIp` stays null until Phase 6 adds the hardened
+/// resolve-validate-pin networking layer. Do not fake an IP.
+model DeliveryAttempt {
+  id                  String                 @id @default(uuid())
+  deliveryId          String
+  attemptNumber       Int
+  requestHeaders      Json
+  responseStatus      Int?
+  responseHeaders     Json?
+  responseBodySnippet String?
+  errorMessage        String?
+  durationMs          Int
+  resolvedIp          String?
+  outcome             DeliveryAttemptOutcome
+  attemptedAt         DateTime               @default(now())
+
+  delivery Delivery @relation(fields: [deliveryId], references: [id])
+
+  @@unique([deliveryId, attemptNumber])
+  @@index([deliveryId, attemptedAt])
 }

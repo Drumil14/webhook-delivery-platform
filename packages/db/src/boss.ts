@@ -81,10 +81,29 @@ export async function fetchDeliveryJob(): Promise<{
   return { id: job.id, data: job.data };
 }
 
-/** Manually mark a fetched job complete. */
-export async function completeDeliveryJob(jobId: string): Promise<void> {
+/**
+ * Manually mark a fetched job complete. If a Prisma transaction is passed, the
+ * completion is run through the pg-boss Prisma adapter so it joins that
+ * transaction (used by the guarded finalize so Delivery state + attempt + queue
+ * completion commit together).
+ */
+export async function completeDeliveryJob(
+  jobId: string,
+  tx?: Prisma.TransactionClient
+): Promise<void> {
   const boss = await getBoss();
-  await boss.complete(QUEUE_NAME, jobId);
+  if (tx) {
+    await boss.complete(QUEUE_NAME, jobId, null, { db: fromPrisma(tx) });
+  } else {
+    await boss.complete(QUEUE_NAME, jobId);
+  }
+}
+
+/** Test-support: current pg-boss state of a job ('active' | 'completed' | ...) or null. */
+export async function getDeliveryJobState(jobId: string): Promise<string | null> {
+  const boss = await getBoss();
+  const job = await boss.getJobById(QUEUE_NAME, jobId);
+  return job?.state ?? null;
 }
 
 /** Delete all jobs on the delivery queue (used by tests for isolation). */

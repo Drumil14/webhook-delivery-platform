@@ -2,7 +2,6 @@ import process from "node:process";
 
 import {
   checkDatabaseConnection,
-  completeDeliveryJob,
   fetchDeliveryJob,
   prisma,
   startDeliveryQueue,
@@ -10,13 +9,13 @@ import {
 } from "@webhook/db";
 import { APP_NAME, QUEUE_NAME } from "@webhook/shared";
 
-// Phase 2 worker: a standalone, long-running Node process that manually consumes
-// the delivery queue. It does NOT send webhooks yet — it only proves durable
-// consumption works (fetch -> inspect -> complete).
-//
-// Future phase note: Phase 3 adds the stale-job guard (using
-// expectedAttemptNumber), DeliveryAttempt, outbound HTTP, retries/backoff, and
-// status transitions. None of that exists here.
+import { processDeliveryJob } from "./process-delivery";
+
+// Phase 3 worker: a standalone, long-running Node process that manually consumes
+// the delivery queue and performs a real HTTP webhook delivery per job (load
+// Delivery -> Event -> Endpoint, POST payloadRaw, record attempt, guarded
+// finalize). It does NOT retry/backoff/sign/SSRF-protect yet — those are later
+// phases.
 
 const POLL_INTERVAL_MS = 1000;
 
@@ -40,8 +39,8 @@ async function main(): Promise<void> {
   console.log(`[worker] pg-boss started; queue "${QUEUE_NAME}" ready.`);
   console.log("[worker] Worker ready.");
 
-  // Manual fetch loop (not work()): Phase 3 needs explicit control over when a
-  // job is completed, so we fetch and complete by hand.
+  // Manual fetch loop (not work()): we need explicit control over when a job is
+  // completed (completion joins the guarded finalize transaction).
   while (running) {
     const job = await fetchDeliveryJob();
 
@@ -50,14 +49,14 @@ async function main(): Promise<void> {
       continue;
     }
 
-    console.log(
-      `[worker] job ${job.id}: deliveryId=${job.data.deliveryId} expectedAttemptNumber=${job.data.expectedAttemptNumber}`
-    );
-
-    // Phase 2 does NOT: send HTTP, create DeliveryAttempt, change Delivery
-    // status, or increment attemptCount. It only completes the job to prove
-    // durable consumption.
-    await completeDeliveryJob(job.id);
+    // One failing job must not kill the loop.
+    try {
+      await processDeliveryJob(job);
+    } catch (error) {
+      // Leave the job for pg-boss to reclaim after expiry (at-least-once); do
+      // not complete it, since we don't know the outcome.
+      console.error(`[worker] Error processing job ${job.id}:`, error);
+    }
   }
 }
 

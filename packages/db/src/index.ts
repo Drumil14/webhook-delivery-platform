@@ -7,9 +7,17 @@ export {
   enqueueDeliveryJob,
   fetchDeliveryJob,
   completeDeliveryJob,
+  getDeliveryJobState,
   purgeDeliveryQueue,
   stopDeliveryQueue,
 } from "./boss";
+export { finalizeDelivery } from "./finalize";
+export type {
+  FinalizeAttempt,
+  FinalizeInput,
+  FinalizeResult,
+  FinalizeHooks,
+} from "./finalize";
 
 // Re-export generated Prisma types/enums (e.g. Account, Endpoint, Event,
 // EndpointStatus, Prisma) so consumers don't import from the generated path.
