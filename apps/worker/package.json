@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./process-delivery": "./src/process-delivery.ts"
+    "./process-delivery": "./src/process-delivery.ts",
+    "./secure-transport": "./src/secure-transport.ts"
   },
   "scripts": {
     "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",

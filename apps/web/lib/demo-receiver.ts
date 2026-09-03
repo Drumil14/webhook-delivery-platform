@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 import { prisma } from "@webhook/db";
+import {
+  MasterKeyError,
+  decryptSecret,
+  loadMasterKey,
+  verifyWebhookSignature,
+} from "@webhook/shared";
 
 // Built-in DEMO receiver (Phase 4). A deterministic failure SIMULATOR with a
 // CLOSED set of modes — not a proxy, not a rules engine, not user-controlled
@@ -15,6 +21,8 @@ export const DEMO_TIMEOUT_DELAY_MS = 12_000;
 
 const DELIVERY_ID_HEADER = "x-webhook-delivery-id";
 
+const SIGNATURE_HEADER = "x-webhook-signature";
+
 const KNOWN_MODES = [
   "success",
   "failure",
@@ -22,6 +30,7 @@ const KNOWN_MODES = [
   "rate-limit",
   "timeout",
   "fail-then-succeed",
+  "verify-signature",
 ] as const;
 type DemoMode = (typeof KNOWN_MODES)[number];
 
@@ -70,6 +79,65 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * CLOSED demo signature-verification mode. Proves the full round trip:
+ * receive exact raw body -> load Delivery -> Event -> Endpoint -> decrypt that
+ * endpoint's signing secret -> verify the HMAC + timestamp over the EXACT bytes
+ * received. Returns 200 {verified:true} or 401 {error:"INVALID_WEBHOOK_SIGNATURE"}.
+ *
+ * The failure reason is deliberately NOT exposed to the (untrusted) caller —
+ * every verification failure collapses to the same opaque 401. Internal logs may
+ * distinguish, but never log secrets.
+ */
+async function handleVerifySignature(request: NextRequest): Promise<NextResponse> {
+  const INVALID = NextResponse.json(
+    { error: "INVALID_WEBHOOK_SIGNATURE" },
+    { status: 401 }
+  );
+
+  // Read the EXACT raw body as received (no parse/re-serialize).
+  const rawBody = await request.text();
+  const deliveryId = request.headers.get(DELIVERY_ID_HEADER)?.trim();
+  const signatureHeader = request.headers.get(SIGNATURE_HEADER);
+  if (!deliveryId) return INVALID;
+
+  try {
+    const delivery = await prisma.delivery.findUnique({
+      where: { id: deliveryId },
+      include: { event: { include: { endpoint: true } } },
+    });
+    if (!delivery) return INVALID;
+
+    const masterKey = loadMasterKey();
+    const secret = decryptSecret(delivery.event.endpoint.secretEncrypted, masterKey);
+
+    const result = verifyWebhookSignature({
+      payloadRaw: rawBody,
+      signatureHeader,
+      secret,
+      now: Math.floor(Date.now() / 1000),
+      toleranceSeconds: 300,
+    });
+
+    if (result.valid) {
+      return NextResponse.json({ verified: true }, { status: 200 });
+    }
+    console.warn(
+      `[demo-receiver] verify-signature rejected deliveryId=${deliveryId} reason=${result.reason}`
+    );
+    return INVALID;
+  } catch (error) {
+    if (error instanceof MasterKeyError) {
+      // Server misconfiguration, not a caller problem.
+      console.error("[demo-receiver] verify-signature master key error:", error.message);
+      return NextResponse.json({ error: "SERVER_MISCONFIGURED" }, { status: 500 });
+    }
+    // Endpoint secret undecryptable or other internal issue -> opaque 401.
+    console.warn(`[demo-receiver] verify-signature internal failure deliveryId=${deliveryId}`);
+    return INVALID;
+  }
+}
+
 export type DemoReceiverOptions = {
   // The /timeout delay. Defaults to the real DEMO_TIMEOUT_DELAY_MS; tests inject
   // a short value to prove delayed behavior without waiting the full timeout.
@@ -111,5 +179,8 @@ export async function handleDemoReceiver(
 
     case "fail-then-succeed":
       return handleFailThenSucceed(request);
+
+    case "verify-signature":
+      return handleVerifySignature(request);
   }
 }

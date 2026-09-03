@@ -13,8 +13,8 @@ import {
 } from "@webhook/db";
 
 import { ingestEvent } from "@/lib/ingest";
-import { POST as createEndpoint } from "@/app/api/v1/endpoints/route";
 import { POST as postEvent } from "@/app/api/v1/endpoints/[endpointId]/events/route";
+import { insertEndpointRow } from "./helpers/phase6";
 
 // REAL integration tests against PostgreSQL + pg-boss. Nothing is mocked except
 // the injectable enqueue seam in the atomicity test.
@@ -29,17 +29,13 @@ function uniqueKey(): string {
   return key;
 }
 
+// Insert the Endpoint row directly (with a real encrypted secret). Phase 6 SSRF
+// now rejects arbitrary URLs at the creation API, and these Phase 2 tests only
+// need an Endpoint to exist — the URL is never actually delivered to here.
 async function makeEndpoint(url = "https://example.com/webhook"): Promise<string> {
-  const req = new Request("http://test/api/v1/endpoints", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ url }),
-  });
-  const res = await createEndpoint(req as never);
-  expect(res.status).toBe(201);
-  const json = (await res.json()) as { id: string };
-  createdEndpointIds.push(json.id);
-  return json.id;
+  const ep = await insertEndpointRow(accountId, url);
+  createdEndpointIds.push(ep.id);
+  return ep.id;
 }
 
 function sendEvent(endpointId: string, key: string, body: unknown) {

@@ -11,16 +11,27 @@ import {
 import {
   DEMO_RETRY_POLICY,
   PRODUCTION_RETRY_POLICY,
+  MasterKeyError,
+  buildSignatureHeader,
   calculateRetryDelay,
+  decryptSecret,
+  loadMasterKey,
   type JobPayload,
   type RetryPolicy,
 } from "@webhook/shared";
 
+import {
+  secureWebhookRequest,
+  type TransportRequest,
+  type TransportResult,
+} from "./secure-transport";
+
 // Phase 5: real HTTP delivery + reliability engine (timeout, backoff, jitter,
-// Retry-After, retry scheduling, application dead-letter). NO HMAC/SSRF yet.
+// Retry-After, retry scheduling, application dead-letter).
+// Phase 6: adds the security boundary — HMAC-SHA256 signing of the exact body,
+// and an SSRF-safe, DNS-pinned HTTPS transport (redirects still never followed).
 
 const USER_AGENT = "webhook-delivery-platform/0.0.0";
-const MAX_RESPONSE_SNIPPET_BYTES = 10 * 1024; // ~10 KB cap to avoid DB bloat
 
 // The real webhook request timeout. The demo /timeout receiver waits 12s, so
 // this produces a genuine timeout. Overridable via options for fast tests.
@@ -37,11 +48,16 @@ const ACTIVE_POLICY: RetryPolicy =
 
 type DeliveryJob = { id: string; data: JobPayload };
 
+// The outbound transport seam. Production uses the SSRF-safe pinned transport;
+// tests inject a deterministic one (plain-HTTP loopback, or a pinned HTTPS server).
+export type WebhookTransport = (req: TransportRequest) => Promise<TransportResult>;
+
 export type ProcessDeliveryOptions = {
   policy?: RetryPolicy; // inject a fast policy in tests
   timeoutMs?: number; // inject a short timeout in tests
-  now?: () => number; // deterministic nextRetryAt in tests
+  now?: () => number; // deterministic nextRetryAt / signature timestamp in tests
   random?: () => number; // deterministic jitter in tests
+  transport?: WebhookTransport; // inject a deterministic transport in tests
 };
 
 function isValidPayload(data: unknown): data is JobPayload {
@@ -62,37 +78,11 @@ function isRetryableStatus(status: number): boolean {
 }
 
 /** Parse a simple integer-seconds Retry-After header into ms (null if absent/invalid). */
-function parseRetryAfterMs(headerValue: string | null): number | null {
+function parseRetryAfterMs(headerValue: string | undefined): number | null {
   if (!headerValue) return null;
   const trimmed = headerValue.trim();
   if (!/^\d+$/.test(trimmed)) return null; // integer seconds only (no HTTP-date)
   return parseInt(trimmed, 10) * 1000;
-}
-
-/** Read a response body, capped at ~maxBytes, so a huge body can't bloat the DB. */
-async function readCappedText(
-  response: Response,
-  maxBytes: number
-): Promise<string | null> {
-  if (!response.body) {
-    const text = await response.text();
-    return text.length > 0 ? text.slice(0, maxBytes) : null;
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (total < maxBytes) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      total += value.length;
-    }
-  }
-  await reader.cancel().catch(() => {});
-  if (total === 0) return null;
-  const buffer = Buffer.concat(chunks).subarray(0, maxBytes);
-  return new TextDecoder().decode(buffer);
 }
 
 /** Best-effort queue completion outside a transaction (stale / malformed jobs). */
@@ -108,9 +98,10 @@ async function safeComplete(jobId: string): Promise<void> {
 }
 
 /**
- * Process exactly one delivery job: load Delivery -> Event -> Endpoint, POST the
- * event's raw body (with a timeout), classify the outcome, then finalize via the
- * guarded transaction — scheduling a retry when appropriate.
+ * Process exactly one delivery job: load Delivery -> Event -> Endpoint, decrypt
+ * the endpoint signing secret, HMAC-sign the event's EXACT raw body, POST it via
+ * the SSRF-safe pinned transport (with a timeout), classify the outcome, then
+ * finalize via the guarded transaction — scheduling a retry when appropriate.
  */
 export async function processDeliveryJob(
   job: DeliveryJob,
@@ -120,6 +111,7 @@ export async function processDeliveryJob(
   const timeoutMs = options.timeoutMs ?? WEBHOOK_TIMEOUT_MS;
   const nowFn = options.now ?? Date.now;
   const random = options.random ?? Math.random;
+  const transport = options.transport ?? ((req) => secureWebhookRequest(req));
 
   if (!isValidPayload(job.data)) {
     console.error(`[worker] Malformed job ${job.id}; discarding.`, job.data);
@@ -141,13 +133,49 @@ export async function processDeliveryJob(
   const event = delivery.event;
   const endpoint = event.endpoint;
 
-  // NO HMAC signature yet (Phase 6). No secrets in headers.
+  // Base headers (no signature yet). Never include the plaintext signing secret.
   const requestHeaders: Record<string, string> = {
     "content-type": "application/json",
     "user-agent": USER_AGENT,
     "x-webhook-event-id": event.id,
     "x-webhook-delivery-id": delivery.id,
   };
+
+  // Decrypt the endpoint signing secret. Fail CLOSED:
+  //  - MasterKeyError (missing/malformed server master key) is an OPERATIONAL
+  //    problem -> rethrow so the whole job fails and ops can fix the env
+  //    (pg-boss infra-retries it). We do NOT mark the delivery dead for an ops error.
+  //  - Any other decrypt failure means THIS endpoint's stored value is not a
+  //    valid encrypted secret (e.g. a legacy Phase 1 placeholder). That is a
+  //    data problem that will never self-heal -> permanent failure, no HTTP.
+  let signingSecret: string;
+  try {
+    const masterKey = loadMasterKey();
+    signingSecret = decryptSecret(endpoint.secretEncrypted, masterKey);
+  } catch (error) {
+    if (error instanceof MasterKeyError) throw error;
+    console.error(
+      `[worker] Endpoint ${endpoint.id} signing secret could not be decrypted; ` +
+        `failing delivery ${deliveryId} permanently.`
+    );
+    await finalizeTerminal({
+      deliveryId,
+      expectedAttemptNumber,
+      jobId: job.id,
+      requestHeaders,
+      errorMessage: "endpoint signing secret unavailable",
+      resolvedIp: null,
+    });
+    return;
+  }
+
+  // Fresh timestamp per ATTEMPT (retries re-sign with a new t -> new signature).
+  const timestamp = Math.floor(nowFn() / 1000);
+  requestHeaders["x-webhook-signature"] = buildSignatureHeader(
+    signingSecret,
+    timestamp,
+    event.payloadRaw // EXACT stored bytes; never parse+re-serialize
+  );
 
   let responseStatus: number | null = null;
   let responseHeaders: Record<string, string> | null = null;
@@ -156,61 +184,61 @@ export async function processDeliveryJob(
   let outcome: DeliveryAttemptOutcome = "failure";
   let retryable = false;
   let retryAfterMs: number | null = null;
+  let resolvedIp: string | null = null;
 
-  // HTTP happens OUTSIDE any transaction, with a hard timeout via AbortController.
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
   const startedAt = performance.now();
-  try {
-    const response = await fetch(endpoint.url, {
-      method: "POST",
-      headers: requestHeaders,
-      body: event.payloadRaw, // exact stored bytes; never re-serialize
-      signal: controller.signal,
-      // Do NOT follow redirects: we must see the actual 3xx (classified as a
-      // permanent failure below), and following a Location would be an SSRF
-      // vector that Phase 6 hardens. So the worker never chases redirects.
-      redirect: "manual",
-    });
+  const result = await transport({
+    url: endpoint.url,
+    headers: requestHeaders,
+    body: event.payloadRaw, // exact stored bytes; never re-serialize
+    timeoutMs,
+  });
+  const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 
-    responseStatus = response.status;
-    responseHeaders = Object.fromEntries(response.headers);
-    responseBodySnippet = await readCappedText(response, MAX_RESPONSE_SNIPPET_BYTES);
+  if (result.kind === "response") {
+    resolvedIp = result.resolvedIp;
+    responseStatus = result.status;
+    responseHeaders = result.headers;
+    responseBodySnippet = result.bodyText;
 
-    if (response.status >= 200 && response.status < 300) {
+    if (result.status >= 200 && result.status < 300) {
       outcome = "success";
       retryable = false;
-    } else if (isRetryableStatus(response.status)) {
+    } else if (isRetryableStatus(result.status)) {
       outcome = "failure";
       retryable = true;
-      if (response.status === 429) {
-        retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      if (result.status === 429) {
+        retryAfterMs = parseRetryAfterMs(result.headers["retry-after"]);
       }
     } else {
       // Non-2xx, non-retryable: the permanent set {400,401,403,404,410} plus any
-      // other 4xx AND 3xx redirects (we use redirect:"manual", so a 302 lands
-      // here). Default: permanent failure -> dead. Keeps HTTP semantics simple.
+      // other 4xx AND 3xx redirects (we never follow redirects, so a 302 lands
+      // here). Default: permanent failure -> dead.
       outcome = "failure";
       retryable = false;
-      errorMessage = `Permanent failure: HTTP ${response.status}`;
+      errorMessage = `Permanent failure: HTTP ${result.status}`;
     }
-  } catch (error) {
-    if (timedOut) {
-      outcome = "timeout";
-      errorMessage = `request timed out after ${timeoutMs}ms`;
-    } else {
-      outcome = "network_error";
-      errorMessage = error instanceof Error ? error.message : String(error);
-    }
+  } else if (result.kind === "ssrf") {
+    // Security preflight blocked the socket. This IS an attempt by our delivery
+    // system, but no HTTP request was made. Classify as a PERMANENT failure
+    // (never network_error) so it does not retry. Keep the message safe/opaque.
+    outcome = "failure";
+    retryable = false;
+    responseStatus = null;
+    responseHeaders = null;
+    errorMessage = "unsafe endpoint destination";
+    resolvedIp = null; // no connection occurred; do not fake a resolvedIp
+  } else if (result.kind === "timeout") {
+    resolvedIp = result.resolvedIp;
+    outcome = "timeout";
     retryable = true;
-  } finally {
-    clearTimeout(timer);
+    errorMessage = `request timed out after ${timeoutMs}ms`;
+  } else {
+    resolvedIp = result.resolvedIp;
+    outcome = "network_error";
+    retryable = true;
+    errorMessage = result.message;
   }
-  const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
 
   // Decide terminal status vs retry.
   let newStatus: DeliveryStatus;
@@ -220,7 +248,7 @@ export async function processDeliveryJob(
   if (outcome === "success") {
     newStatus = "succeeded";
   } else if (!retryable) {
-    newStatus = "dead"; // permanent HTTP failure
+    newStatus = "dead"; // permanent HTTP / security failure
   } else if (expectedAttemptNumber < delivery.maxAttempts) {
     // Retryable with budget remaining -> schedule next attempt.
     const nextN = expectedAttemptNumber + 1;
@@ -241,11 +269,11 @@ export async function processDeliveryJob(
     responseBodySnippet,
     errorMessage,
     durationMs,
-    resolvedIp: null, // Phase 6 owns hardened DNS resolve/pin.
+    resolvedIp,
     outcome,
   };
 
-  const result = await finalizeDelivery({
+  const finalizeResult = await finalizeDelivery({
     deliveryId,
     expectedAttemptNumber,
     jobId: job.id,
@@ -255,7 +283,7 @@ export async function processDeliveryJob(
     retry,
   });
 
-  if (result === "stale") {
+  if (finalizeResult === "stale") {
     console.warn(
       `[worker] Discarded stale completion: deliveryId=${deliveryId} expectedAttemptNumber=${expectedAttemptNumber}`
     );
@@ -265,8 +293,44 @@ export async function processDeliveryJob(
 
   console.log(
     `[worker] delivery deliveryId=${deliveryId} attemptNumber=${expectedAttemptNumber} ` +
-      `httpStatus=${responseStatus ?? "n/a"} durationMs=${durationMs} outcome=${outcome} ` +
-      `deliveryStatus=${newStatus} retryScheduled=${retry ? "true" : "false"} ` +
+      `resolvedIp=${resolvedIp ?? "n/a"} httpStatus=${responseStatus ?? "n/a"} durationMs=${durationMs} ` +
+      `outcome=${outcome} deliveryStatus=${newStatus} retryScheduled=${retry ? "true" : "false"} ` +
       `nextRetryAt=${nextRetryAt ? nextRetryAt.toISOString() : "null"}`
   );
+}
+
+/**
+ * Record a permanent (non-HTTP) failure attempt and mark the Delivery dead via
+ * the guarded finalize transaction. Used when we cannot even attempt the socket
+ * (e.g. the endpoint's signing secret is undecryptable). No retry.
+ */
+async function finalizeTerminal(args: {
+  deliveryId: string;
+  expectedAttemptNumber: number;
+  jobId: string;
+  requestHeaders: Record<string, string>;
+  errorMessage: string;
+  resolvedIp: string | null;
+}): Promise<void> {
+  const attempt: FinalizeAttempt = {
+    requestHeaders: args.requestHeaders,
+    responseStatus: null,
+    responseHeaders: null,
+    responseBodySnippet: null,
+    errorMessage: args.errorMessage,
+    durationMs: 0,
+    resolvedIp: args.resolvedIp,
+    outcome: "failure",
+  };
+  const finalizeResult = await finalizeDelivery({
+    deliveryId: args.deliveryId,
+    expectedAttemptNumber: args.expectedAttemptNumber,
+    jobId: args.jobId,
+    newStatus: "dead",
+    nextRetryAt: null,
+    attempt,
+  });
+  if (finalizeResult === "stale") {
+    await safeComplete(args.jobId);
+  }
 }

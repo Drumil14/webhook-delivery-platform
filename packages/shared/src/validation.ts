@@ -33,30 +33,6 @@ export function validateEventBody(raw: string): EventBodyValidation {
   return { ok: true, type };
 }
 
-export type EndpointUrlValidation =
-  | { ok: true; url: string }
-  | { ok: false; error: "VALIDATION_ERROR"; message: string };
-
-/** Validate an endpoint URL: must be a parseable http(s) URL. */
-export function validateEndpointUrl(url: unknown): EndpointUrlValidation {
-  if (typeof url !== "string" || url.trim() === "") {
-    return { ok: false, error: "VALIDATION_ERROR", message: "`url` is required." };
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return { ok: false, error: "VALIDATION_ERROR", message: "`url` is not a valid URL." };
-  }
-
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return {
-      ok: false,
-      error: "VALIDATION_ERROR",
-      message: "`url` must use http or https.",
-    };
-  }
-
-  return { ok: true, url };
-}
+// NOTE: endpoint URL validation moved to ./ssrf.ts in Phase 6 (validateEndpointUrlSyntax),
+// where it enforces the real production policy (https-only, no credentials) and
+// pairs with DNS/IP SSRF checks. The old permissive http-or-https validator is gone.

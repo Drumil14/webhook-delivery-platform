@@ -19,9 +19,9 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.0",
     "@types/node": "^24.0.0",
-    "@webhook/worker": "workspace:*",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "@webhook/worker": "workspace:*",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.0"

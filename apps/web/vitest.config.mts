@@ -30,9 +30,10 @@ export default defineConfig({
     // are already tiny via injected test policies — this is purely network time.)
     testTimeout: 30_000,
     hookTimeout: 30_000,
-    // Forward the resolved connection string to worker processes.
+    // Forward the resolved connection string + master key to worker processes.
     env: {
       DATABASE_URL: process.env.DATABASE_URL ?? "",
+      WEBHOOK_SECRET_ENCRYPTION_KEY: process.env.WEBHOOK_SECRET_ENCRYPTION_KEY ?? "",
     },
   },
 });

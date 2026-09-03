@@ -17,8 +17,8 @@ import {
 
 import { processDeliveryJob } from "@webhook/worker/process-delivery";
 
-import { POST as createEndpoint } from "@/app/api/v1/endpoints/route";
 import { POST as postEvent } from "@/app/api/v1/endpoints/[endpointId]/events/route";
+import { httpLoopbackTransport, insertEndpointRow } from "./helpers/phase6";
 
 // ---- Controlled local HTTP test server (exists only in tests) --------------
 type Received = {
@@ -84,17 +84,13 @@ function uniqueKey(): string {
   return key;
 }
 
+// Insert the Endpoint row directly (http loopback URL). Phase 6 SSRF rejects
+// http/localhost at the creation API, so tests bypass it and inject a
+// deterministic loopback transport into the worker (see processNext).
 async function makeEndpoint(path: string): Promise<string> {
-  const req = new Request("http://test/api/v1/endpoints", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ url: `${baseUrl}${path}` }),
-  });
-  const res = await createEndpoint(req as never);
-  expect(res.status).toBe(201);
-  const json = (await res.json()) as { id: string };
-  createdEndpointIds.push(json.id);
-  return json.id;
+  const ep = await insertEndpointRow(accountId, `${baseUrl}${path}`);
+  createdEndpointIds.push(ep.id);
+  return ep.id;
 }
 
 function sendEvent(endpointId: string, key: string, body: unknown) {
@@ -120,7 +116,7 @@ async function loadForKey(key: string) {
 async function processNext(): Promise<void> {
   const job = await fetchDeliveryJob();
   expect(job).not.toBeNull();
-  await processDeliveryJob(job!);
+  await processDeliveryJob(job!, { transport: httpLoopbackTransport() });
 }
 
 function fixtureAttempt(): FinalizeAttempt {

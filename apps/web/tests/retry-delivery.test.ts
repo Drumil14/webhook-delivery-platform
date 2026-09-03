@@ -26,8 +26,14 @@ import {
 } from "@webhook/worker/process-delivery";
 
 import { handleDemoReceiver } from "@/lib/demo-receiver";
-import { POST as createEndpoint } from "@/app/api/v1/endpoints/route";
 import { POST as postEvent } from "@/app/api/v1/endpoints/[endpointId]/events/route";
+import { httpLoopbackTransport, insertEndpointRow } from "./helpers/phase6";
+
+// Deterministic loopback transport: the worker's SSRF-safe HTTPS transport can't
+// reach the plain-HTTP local receiver, so Phase 5 reliability tests inject this
+// (it still honors redirect:manual + timeout). The REAL pinned HTTPS transport
+// is exercised in secure-delivery.test.ts.
+const LOOPBACK = httpLoopbackTransport();
 
 // Fast policy for driving retries in tests: tiny delays, no jitter. The retry
 // BUDGET still comes from Delivery.maxAttempts, not this policy.
@@ -129,17 +135,11 @@ function uniqueKey(): string {
   return key;
 }
 
+// Insert the Endpoint row directly (http loopback URL bypasses creation SSRF).
 async function makeEndpoint(url: string): Promise<string> {
-  const req = new Request("http://test/api/v1/endpoints", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ url }),
-  });
-  const res = await createEndpoint(req as never);
-  expect(res.status).toBe(201);
-  const json = (await res.json()) as { id: string };
-  createdEndpointIds.push(json.id);
-  return json.id;
+  const ep = await insertEndpointRow(accountId, url);
+  createdEndpointIds.push(ep.id);
+  return ep.id;
 }
 
 async function ingest(endpointId: string, key: string): Promise<string> {
@@ -167,7 +167,7 @@ async function drive(deliveryId: string): Promise<void> {
   for (let i = 0; i < 15; i++) {
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
     if (!job) break;
-    await processDeliveryJob(job, { policy: TINY_POLICY, random: () => 0.5 });
+    await processDeliveryJob(job, { policy: TINY_POLICY, random: () => 0.5, transport: LOOPBACK });
     const d = await prisma.delivery.findUniqueOrThrow({
       where: { id: deliveryId },
       select: { status: true },
@@ -237,7 +237,7 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
     const deliveryId = await ingest(endpointId, uniqueKey());
 
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
-    await processDeliveryJob(job!, { policy: TINY_POLICY, random: () => 0.5 });
+    await processDeliveryJob(job!, { policy: TINY_POLICY, random: () => 0.5, transport: LOOPBACK });
 
     const d = await prisma.delivery.findUniqueOrThrow({ where: { id: deliveryId } });
     expect(d.status).toBe("pending");
@@ -297,7 +297,7 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
 
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
     // Demo policy backoff for attempt 2 (~1.6s at random=0) < 5s, so Retry-After wins.
-    await processDeliveryJob(job!, { now: () => fixedNow, random: () => 0 });
+    await processDeliveryJob(job!, { now: () => fixedNow, random: () => 0, transport: LOOPBACK });
 
     const d = await prisma.delivery.findUniqueOrThrow({ where: { id: deliveryId } });
     expect(d.status).toBe("pending");
@@ -316,7 +316,7 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
     const deliveryId = await ingest(endpointId, uniqueKey());
 
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
-    await processDeliveryJob(job!, { policy: TINY_POLICY, timeoutMs: 200, random: () => 0.5 });
+    await processDeliveryJob(job!, { policy: TINY_POLICY, timeoutMs: 200, random: () => 0.5, transport: LOOPBACK });
 
     const a = await prisma.deliveryAttempt.findFirstOrThrow({ where: { deliveryId } });
     expect(a.outcome).toBe("timeout");
@@ -334,7 +334,7 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
 
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
     // Must not throw out of processDeliveryJob.
-    await processDeliveryJob(job!, { policy: TINY_POLICY, timeoutMs: 3_000, random: () => 0.5 });
+    await processDeliveryJob(job!, { policy: TINY_POLICY, timeoutMs: 3_000, random: () => 0.5, transport: LOOPBACK });
 
     const a = await prisma.deliveryAttempt.findFirstOrThrow({ where: { deliveryId } });
     expect(a.outcome).toBe("network_error");
@@ -426,7 +426,7 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
     const deliveryId = await ingest(endpointId, uniqueKey());
 
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
-    await processDeliveryJob(job!, { policy: TINY_POLICY, random: () => 0.5 });
+    await processDeliveryJob(job!, { policy: TINY_POLICY, random: () => 0.5, transport: LOOPBACK });
 
     const d = await prisma.delivery.findUniqueOrThrow({ where: { id: deliveryId } });
     expect(d.status).toBe("dead");
@@ -452,7 +452,7 @@ describe("Phase 5 — retries, backoff, timeout, DLQ, recovery", () => {
     const deliveryId = await ingest(endpointId, uniqueKey());
 
     const job = await fetchDeliveryJob({ ignoreStartAfter: true });
-    await processDeliveryJob(job!, { policy: TINY_POLICY, random: () => 0.5 });
+    await processDeliveryJob(job!, { policy: TINY_POLICY, random: () => 0.5, transport: LOOPBACK });
 
     // The redirect target must NOT have been fetched.
     expect(hitPaths).toContain("/redirect");

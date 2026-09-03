@@ -8,8 +8,8 @@ import {
   stopDeliveryQueue,
 } from "@webhook/db";
 
-import { POST as createEndpoint } from "@/app/api/v1/endpoints/route";
 import { POST as postEvent } from "@/app/api/v1/endpoints/[endpointId]/events/route";
+import { insertEndpointRow } from "./helpers/phase6";
 
 // These are REAL integration tests: they call the actual route handlers, which
 // hit the actual PostgreSQL database. Idempotency is NOT mocked.
@@ -24,17 +24,12 @@ function uniqueKey(): string {
   return key;
 }
 
+// Insert the Endpoint row directly (Phase 6 SSRF rejects arbitrary URLs at the
+// creation API; these idempotency tests only need an Endpoint to exist).
 async function makeEndpoint(url = "https://example.com/webhook"): Promise<string> {
-  const req = new Request("http://test/api/v1/endpoints", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ url }),
-  });
-  const res = await createEndpoint(req as never);
-  expect(res.status).toBe(201);
-  const json = (await res.json()) as { id: string };
-  createdEndpointIds.push(json.id);
-  return json.id;
+  const ep = await insertEndpointRow(accountId, url);
+  createdEndpointIds.push(ep.id);
+  return ep.id;
 }
 
 function eventRequest(endpointId: string, key: string, body: unknown): Request {
