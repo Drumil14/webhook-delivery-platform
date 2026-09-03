@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { ensureDemoAccount, prisma } from "@webhook/db";
+import {
+  ensureDemoAccount,
+  prisma,
+  stopDeliveryQueue,
+} from "@webhook/db";
 
 import { POST as createEndpoint } from "@/app/api/v1/endpoints/route";
 import { POST as postEvent } from "@/app/api/v1/endpoints/[endpointId]/events/route";
@@ -59,8 +63,17 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  // Clean up rows created by this test run.
+  // Clean up rows created by this test run. Deliveries reference Events (FK
+  // RESTRICT), so delete Deliveries first.
   if (usedKeys.length > 0) {
+    const events = await prisma.event.findMany({
+      where: { accountId, idempotencyKey: { in: usedKeys } },
+      select: { id: true },
+    });
+    const eventIds = events.map((e) => e.id);
+    if (eventIds.length > 0) {
+      await prisma.delivery.deleteMany({ where: { eventId: { in: eventIds } } });
+    }
     await prisma.event.deleteMany({
       where: { accountId, idempotencyKey: { in: usedKeys } },
     });
@@ -70,6 +83,8 @@ afterAll(async () => {
       where: { id: { in: createdEndpointIds } },
     });
   }
+  // Ingestion now starts pg-boss; stop it so the test process exits cleanly.
+  await stopDeliveryQueue();
   await prisma.$disconnect();
 });
 

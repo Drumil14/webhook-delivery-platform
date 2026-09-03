@@ -11,8 +11,13 @@
 // Phase 2+.
 
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  // partialIndexes: a Preview feature introduced in Prisma 7.4 (we are on 7.10),
+  // with migrate + introspection support. Needed for the "one automatic Delivery
+  // per Event" partial unique index below — expressing it in the schema (rather
+  // than raw SQL only) is what keeps `prisma migrate` drift-free.
+  previewFeatures = ["partialIndexes"]
 }
 
 datasource db {
@@ -76,12 +81,59 @@ model Event {
   payloadFingerprint String
   receivedAt         DateTime @default(now())
 
-  account  Account  @relation(fields: [accountId], references: [id])
-  endpoint Endpoint @relation(fields: [endpointId], references: [id])
+  account    Account    @relation(fields: [accountId], references: [id])
+  endpoint   Endpoint   @relation(fields: [endpointId], references: [id])
+  deliveries Delivery[]
 
   // The database unique constraint is the AUTHORITY for idempotency (see
   // apps/web/lib/ingest.ts — INSERT ... ON CONFLICT DO NOTHING).
   @@unique([accountId, idempotencyKey])
   @@index([accountId, receivedAt])
   @@index([endpointId])
+}
+
+enum DeliveryStatus {
+  pending
+  succeeded
+  dead
+  // NOTE: no `in_progress` state — deliberately removed from the architecture.
+}
+
+enum DeliveryTrigger {
+  automatic
+  // `manual_replay` exists for the final architecture but is NOT used in Phase 2.
+  manual_replay
+}
+
+/// A durable attempt-to-deliver record for an Event. Phase 2 creates exactly one
+/// AUTOMATIC Delivery per Event (status=pending, attemptCount=0) atomically with
+/// the Event and the pg-boss job. Replay (Phase 7) will add manual_replay rows.
+///
+/// Future phase note: DeliveryAttempt (Phase 3), status transitions, retries,
+/// and replay wiring are NOT implemented yet.
+model Delivery {
+  id                 String          @id @default(uuid())
+  eventId            String
+  status             DeliveryStatus  @default(pending)
+  attemptCount       Int             @default(0)
+  // Matches the active demo retry policy (6 attempts). Phase 5 will derive/set
+  // this explicitly from the selected retry policy.
+  maxAttempts        Int             @default(6)
+  nextRetryAt        DateTime?
+  triggeredBy        DeliveryTrigger @default(automatic)
+  replayOfDeliveryId String?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  event    Event      @relation(fields: [eventId], references: [id])
+  replayOf Delivery?  @relation("DeliveryReplays", fields: [replayOfDeliveryId], references: [id])
+  replays  Delivery[] @relation("DeliveryReplays")
+
+  @@index([eventId])
+  // Frozen index for the future retry sweeper (Phase 3+): find due deliveries.
+  @@index([status, nextRetryAt])
+  // At most ONE automatic Delivery per Event. Partial unique index so replay can
+  // still add additional (manual_replay) Delivery rows for the same Event later.
+  // NOT a plain UNIQUE(eventId) — that would block Phase 7 replay.
+  @@unique([eventId], where: raw("\"triggeredBy\" = 'automatic'"), map: "Delivery_eventId_automatic_key")
 }

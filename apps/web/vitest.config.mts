@@ -20,6 +20,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // Test files share one real database and ONE pg-boss queue. Run files
+    // sequentially so a queue `fetch()` in one file can't grab another file's
+    // job. (Tests within a file already run sequentially.)
+    fileParallelism: false,
     // Forward the resolved connection string to worker processes.
     env: {
       DATABASE_URL: process.env.DATABASE_URL ?? "",

@@ -15,3 +15,5 @@ export {
   validateEndpointUrl,
 } from "./validation";
 export type { EventBodyValidation, EndpointUrlValidation } from "./validation";
+export { QUEUE_NAME } from "./queue";
+export type { JobPayload } from "./queue";
