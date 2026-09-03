@@ -173,3 +173,14 @@ model DeliveryAttempt {
   @@unique([deliveryId, attemptNumber])
   @@index([deliveryId, attemptedAt])
 }
+
+/// State for the built-in DEMO webhook receiver only (Phase 4). It drives
+/// deterministic failure simulation (e.g. fail-then-succeed) and is NOT part of
+/// the webhook delivery domain — hence no FK to Delivery. Keyed by the incoming
+/// X-Webhook-Delivery-Id so retries within one Delivery share a counter while a
+/// replay (new Delivery id) starts fresh.
+model DemoReceiverState {
+  deliveryId   String   @id
+  requestCount Int      @default(0)
+  updatedAt    DateTime @updatedAt
+}
